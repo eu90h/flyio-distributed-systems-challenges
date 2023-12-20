@@ -244,7 +244,7 @@ func main() {
 	n.Handle("topology", broadcaster.HandleTopologyMessage)
 	n.Handle("gossip", broadcaster.HandleGossipMessage)
 
-	ticker := time.NewTicker(5 * time.Millisecond)
+	ticker := time.NewTicker(5 * time.Second)
     done := make(chan bool)
     go func() {
         for {
