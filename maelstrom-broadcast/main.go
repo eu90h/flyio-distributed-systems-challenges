@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -12,107 +13,78 @@ import (
 )
 
 type Broadcaster struct {
-	values_seen []int
+	msg_ids_seen map[int]bool
+	values []int
 	neighbors []string
-	msgs_seen []int
 	node *maelstrom.Node
 	mu sync.Mutex
 }
 
-func (b *Broadcaster) SetValue(v int) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.values_seen = append(b.values_seen, v)
-}
-
-func (b *Broadcaster) SetTopology(t []string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.neighbors = t
-}
-
 func RandomID() (int, error) {
-	k := make([]byte, 8)
+	k := make([]byte, 4)
 	_, err := rand.Read(k)
 	if err != nil {
-		log.Fatal(err)
 		return 0, err
 	}
 	return int(binary.BigEndian.Uint32(k)), nil
 }
 
-func (b *Broadcaster) RememberMessageID(v int) {
+func (b *Broadcaster) Multicast(msg interface{}) {
+	b.MulticastExclude(msg, "")
+}
+
+func (b *Broadcaster) MulticastExclude(msg interface{}, excluded_node string) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.msgs_seen = append(b.msgs_seen, v)
-}
-
-func (b *Broadcaster) MulticastSend(msg interface{}) {
-	for _, node := range b.neighbors {
-		b.node.Send(node, msg)
-	}
-}
-
-func (b *Broadcaster) PropagateValue(v int, id *int) {
 	if b.node == nil {
 		panic("me is nil")
 	}
+	for _, node := range b.neighbors {
+		if node != excluded_node {
+			err := b.node.RPC(node, msg, b.HandleGossipResponse)
+			if err != nil {
+				log.Printf("problem sending message to node %v\n", node)
+			}
+		}
+	}
+	b.mu.Unlock()
+}
 
+func (b *Broadcaster) PropagateValue(v int) {
 	msg := make(map[string]any)
 	msg["type"] = "gossip"
-	msg["value"] = v
-
-	if id != nil {
-		msg["msg_id"] = *id
-	} else {
-		r, err := RandomID()
-		if err != nil {
-			log.Fatal(err)
-		}
-		msg["msg_id"] = r
-		b.RememberMessageID(r)
+	msg["message"] = v
+	r, err := RandomID()
+	if err != nil {
+		log.Fatal(err)
 	}
+	msg["tag"] = r
 
-	b.MulticastSend(msg)
+	b.mu.Lock()
+	b.msg_ids_seen[r] = true
+	b.mu.Unlock()
+	b.Multicast(msg)
 }
 
-func (b *Broadcaster) SeenGossipMessage(msg_id int) bool {
-	for _, id := range b.msgs_seen {
-		if msg_id == id {
-			return true
-		}
-	}
-	return false
-}
-
-func GetBroadcastValue(msg_body []byte) (int, error) {
-	var body map[string]any
-	if err := json.Unmarshal(msg_body, &body); err != nil {
-		return 0, err
-	}
-	return int(body["message"].(float64)), nil
-}
-
-func (b *Broadcaster) HandleTopologyMessage(msg maelstrom.Message) error {
-	var body map[string]any
+func (b *Broadcaster) HandleBroadcastMessage(msg maelstrom.Message) error {
+	body := make(map[string]any)
 	if err := json.Unmarshal(msg.Body, &body); err != nil {
 		return err
 	}
 
-	response := make(map[string]any)
-	response["type"] = "topology_ok"
+	message_value := int(body["message"].(float64))
 
-	ns, ok := body["topology"].(map[string]interface{})[b.node.ID()].([]interface{})
-	if len(ns) <= 0 || !ok {
-		return b.node.Reply(msg, response)
-	}
+	b.mu.Lock()
+	b.values = append(b.values, message_value)
+	b.mu.Unlock()
+	b.PropagateValue(message_value)
 
-	s := make([]string, len(ns))
-	for i, v := range ns {
-		s[i] = fmt.Sprint(v)
-	}
-	b.SetTopology(s)
-	return b.node.Reply(msg, response)
+	reply := make(map[string]any)
+	reply["type"] = "broadcast_ok"
+	return b.node.Reply(msg, reply)
+}
+
+func (b *Broadcaster) HandleGossipResponse(msg maelstrom.Message) error {
+	return nil
 }
 
 func (b *Broadcaster) HandleReadMessage(msg maelstrom.Message) error {
@@ -120,54 +92,80 @@ func (b *Broadcaster) HandleReadMessage(msg maelstrom.Message) error {
 	body["type"] = "read_ok"
 
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	body["messages"] = b.values_seen
+	body["messages"] = b.values
+	b.mu.Unlock()
 
 	return b.node.Reply(msg, body)
 }
 
-func (b *Broadcaster) HandleBroadcastMessage(msg maelstrom.Message) error {
-	response := make(map[string]any)
-	response["type"] = "broadcast_ok"
-	v, err := GetBroadcastValue(msg.Body)
+func GetNeighbors(msg maelstrom.Message, node_id string) ([]string, error) {
+	var body map[string]any
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return nil, err
+	}
+
+	ns, ok := body["topology"].(map[string]interface{})[node_id].([]interface{})
+	if len(ns) < 0 || !ok {
+		return nil, errors.New("problem parsing topology message")
+	}
+
+	s := make([]string, len(ns))
+	for i, v := range ns {
+		s[i] = fmt.Sprint(v)
+	}
+
+	return s, nil
+}
+
+func (b *Broadcaster) HandleTopologyMessage(msg maelstrom.Message) error {
+	b.mu.Lock()
+	neighbors, err := GetNeighbors(msg, b.node.ID())
 	if err != nil {
 		return err
 	}
+	b.neighbors = neighbors
+	b.mu.Unlock()
 
-	b.SetValue(int(v))
-	b.PropagateValue(int(v), nil)
+	reply := make(map[string]any)
+	reply["type"] = "topology_ok"
 
-	return b.node.Reply(msg, response)
+	return b.node.Reply(msg, reply)
 }
 
 func (b *Broadcaster) HandleGossipMessage(msg maelstrom.Message) error {
-	var body map[string]any
+	body := make(map[string]any)
 	if err := json.Unmarshal(msg.Body, &body); err != nil {
-		log.Printf("error unmarshalling message %v\n", msg)
 		return err
 	}
 
-	msg_id := int(body["msg_id"].(float64))
-	if b.SeenGossipMessage(msg_id) {
-		return nil
-	}
+	message_value := int(body["message"].(float64))
+	message_tag := int(body["tag"].(float64))
 
-	if v, ok := body["value"].(float64); ok {
-		b.SetValue(int(v))
-		b.RememberMessageID(msg_id)
-		b.MulticastSend(msg.Body)
-		return nil
+	b.mu.Lock()
+	if b.msg_ids_seen[message_tag] {
+		reply := make(map[string]any)
+		reply["type"] = "gossip_ok"
+		b.mu.Unlock()
+		return b.node.Reply(msg, reply)
 	}
+	b.msg_ids_seen[message_tag] = true
+	b.values = append(b.values, message_value)
+	b.mu.Unlock()
+	b.MulticastExclude(body, msg.Src)
 
-	return nil
+	reply := make(map[string]any)
+	reply["type"] = "gossip_ok"
+
+	return b.node.Reply(msg, reply)
 }
 
 func main() {
 	n := maelstrom.NewNode()
 	broadcaster := Broadcaster{}
 	broadcaster.node = n
-	broadcaster.values_seen = make([]int, 0)
-	broadcaster.msgs_seen = make([]int, 0)
+	broadcaster.msg_ids_seen = make(map[int]bool)
+	broadcaster.values = make([]int, 0)
+	broadcaster.neighbors = make([]string, 0)
 
 	n.Handle("broadcast", broadcaster.HandleBroadcastMessage)
 	n.Handle("read", broadcaster.HandleReadMessage)
