@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -63,12 +64,12 @@ type InitMessage struct {
 }
 
 type Akfak struct {
-	data map[string][]LogEntry
 	committed_offsets map[string]int
 	//maps keys to the next file offset
 	next_offset map[string]int
 	neighbors []string
 	node *maelstrom.Node
+	kv *maelstrom.KV
 	mu sync.Mutex
 }
 
@@ -128,18 +129,18 @@ func (ak *Akfak) HandlePoll(raw_msg maelstrom.Message) error {
 		ak.mu.Lock()
 		if _, ok := ak.next_offset[key]; ok {
 			Off := ak.next_offset[key]
-			log.Printf("ak.next_offset[%v] = %v\n", key, ak.next_offset[key])
+			//log.Printf("ak.next_offset[%v] = %v\n", key, ak.next_offset[key])
 			ak.mu.Unlock()
 			response.Messages[key] = make([][2]int, 0)
 			for offset := 1; offset <= Off; offset += 1 {
 				if offset >= msg.Offsets[key] {
 					le, err := ak.ReadLogEntry(key, offset)
 					if err == nil {
-						log.Printf("read value %v @ offset %v for key %v\n", le.Value, offset, key)
+						//log.Printf("read value %v @ offset %v for key %v\n", le.Value, offset, key)
 						response.Messages[key] = append(response.Messages[key], [2]int{offset, int(le.Value)})
 					} else {
 						log.Println(err)
-						log.Printf("failed to read offset %v for key %v\n", offset, key)
+					//	log.Printf("failed to read offset %v for key %v\n", offset, key)
 					}
 				}
 			}
@@ -161,6 +162,7 @@ func (ak *Akfak) HandleCommitOffsets(raw_msg maelstrom.Message) error {
 	}
 	ak.mu.Lock()
 	for key := range msg.Offsets {
+		//TODO: this state has to be shared somehow with the other nodes
 		ak.committed_offsets[key] = msg.Offsets[key]
 	}
 	ak.mu.Unlock()
@@ -182,10 +184,10 @@ func (ak *Akfak) HandleListCommittedOffsets(raw_msg maelstrom.Message) error {
 	ak.mu.Lock()
 	for _, key := range msg.Keys {
 		if _, ok := ak.committed_offsets[key]; ok { 
-			log.Printf("node %v checking comitted offsets for %v: %v\n", ak.node.ID(), key, ak.committed_offsets[key])
+			//log.Printf("node %v checking comitted offsets for %v: %v\n", ak.node.ID(), key, ak.committed_offsets[key])
 			response.Offsets[key] = ak.committed_offsets[key]
 		} else {
-			log.Printf("node %v checking comitted offsets for %v: []\n", ak.node.ID(), key)
+			//log.Printf("node %v checking comitted offsets for %v: []\n", ak.node.ID(), key)
 		}
 	}
 	ak.mu.Unlock()
@@ -195,19 +197,44 @@ func (ak *Akfak) HandleListCommittedOffsets(raw_msg maelstrom.Message) error {
 func (ak *Akfak) WriteLogEntry(key string, le LogEntry) (int, error) {
 	ak.mu.Lock()
 	defer ak.mu.Unlock()
-	if _, ok := ak.data[key]; ok {
-		ak.data[key] = append(ak.data[key], le)
-	} else {
-		ak.data[key] = make([]LogEntry, 0)
-		ak.data[key] = append(ak.data[key], le)
+	ctx := context.Background()
+	entries := make([]LogEntry, 128)
+	err := ak.kv.ReadInto(ctx, key, &entries)
+	if err != nil {
+		log.Printf("[WriteLogEntry] err reading key %s: %v\n", key, err)
+		target := &maelstrom.RPCError{}
+		if errors.As(err, &target) {
+			if target.Code == maelstrom.KeyDoesNotExist {
+				ctx2 := context.Background()
+				err = ak.kv.Write(ctx2, key, []LogEntry{le})
+				if err != nil {
+					log.Printf("[WriteLogEntry] err writing value %v to key %s: %v\n", key, le.Value, err)
+					return 0, err
+				}
+				return le.Offset, nil
+			} else {
+				return 0, err
+			}
+		} else {
+			return 0, err
+		}
 	}
+	ctx = context.Background()
+	ak.kv.Write(ctx, key, append(entries, le))
 	return le.Offset, nil
 }
 
 func (ak *Akfak) ReadLogEntry(key string, offset int) (LogEntry, error) {
 	ak.mu.Lock()
 	defer ak.mu.Unlock()
-	for _, le := range ak.data[key] {
+	ctx := context.Background()
+	entries := make([]LogEntry, 128)
+	err := ak.kv.ReadInto(ctx, key, &entries)
+	if err != nil {
+		log.Printf("[ReadLogEntry] err reading key %s: %v\n", key, err)
+		return LogEntry{}, err
+	}
+	for _, le := range entries {
 		if le.Offset == offset {
 			return le, nil
 		}
@@ -221,7 +248,7 @@ func main() {
 	ak.neighbors = make([]string, 8)
 	ak.committed_offsets = make(map[string]int)
 	ak.next_offset = make(map[string]int)
-	ak.data = make(map[string][]LogEntry)
+	ak.kv = maelstrom.NewLinKV(ak.node)
 
 	ak.node.Handle("init", ak.HandleInit)
 	ak.node.Handle("send", ak.HandleSend)
