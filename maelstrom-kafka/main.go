@@ -1,15 +1,9 @@
 package main
 
 import (
-	"bufio"
-	"crypto/rand"
-	"crypto/sha512"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
-	"os"
-	//"strconv"
 	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
@@ -69,33 +63,13 @@ type InitMessage struct {
 }
 
 type Akfak struct {
-	filenames map[string]string
+	data map[string][]LogEntry
 	committed_offsets map[string]int
 	//maps keys to the next file offset
 	next_offset map[string]int
 	neighbors []string
 	node *maelstrom.Node
 	mu sync.Mutex
-}
-
-func (ak *Akfak) NewFilename(key string) string {
-	sha := sha512.New()
-	sha.Write([]byte(key))
-	k := make([]byte, 4)
-	_, err := rand.Read(k)
-	if err != nil {
-		log.Fatal(err)
-	}
-	sha.Write(k)
-	return fmt.Sprintf("/tmp/%x", sha.Sum(nil))
-}
-
-func (ak *Akfak) GetFilename(key string) string {
-	if filename, ok := ak.filenames[key]; ok {
-		return filename
-	}
-	ak.filenames[key] = ak.NewFilename(key)
-	return ak.filenames[key]
 }
 
 func (ak *Akfak) HandleInit(raw_msg maelstrom.Message) error {
@@ -125,15 +99,13 @@ func (ak *Akfak) HandleSend(raw_msg maelstrom.Message) error {
 		return errors.New("HandleSendMessage tried to process incorrect message type!")
 	}
 	ak.mu.Lock()
-	filename := ak.GetFilename(msg.Key)
 	if _, ok := ak.next_offset[msg.Key]; !ok {
 		ak.next_offset[msg.Key] = 0
 	}
 	ak.next_offset[msg.Key] += 1
-	//ak.committed_offsets[msg.Key] += 1
 	le := LogEntry{ak.next_offset[msg.Key], msg.Message}
 	ak.mu.Unlock()
-	offset, err := ak.WriteLogEntry(msg.Key, le, filename)
+	offset, err := ak.WriteLogEntry(msg.Key, le)
 	if err != nil {
 		log.Println(err)
 		return err
@@ -156,16 +128,15 @@ func (ak *Akfak) HandlePoll(raw_msg maelstrom.Message) error {
 		ak.mu.Lock()
 		if _, ok := ak.next_offset[key]; ok {
 			Off := ak.next_offset[key]
-			filename := ak.GetFilename(key)
 			log.Printf("ak.next_offset[%v] = %v\n", key, ak.next_offset[key])
 			ak.mu.Unlock()
 			response.Messages[key] = make([][2]int, 0)
 			for offset := 1; offset <= Off; offset += 1 {
 				if offset >= msg.Offsets[key] {
-					value, err := ak.ReadLogEntry(key, offset, filename)
+					le, err := ak.ReadLogEntry(key, offset)
 					if err == nil {
-						log.Printf("read value %v @ offset %v for key %v\n", value, offset, key)
-						response.Messages[key] = append(response.Messages[key], [2]int{offset, int(value)})
+						log.Printf("read value %v @ offset %v for key %v\n", le.Value, offset, key)
+						response.Messages[key] = append(response.Messages[key], [2]int{offset, int(le.Value)})
 					} else {
 						log.Println(err)
 						log.Printf("failed to read offset %v for key %v\n", offset, key)
@@ -221,49 +192,27 @@ func (ak *Akfak) HandleListCommittedOffsets(raw_msg maelstrom.Message) error {
 	return ak.node.Reply(raw_msg, response)
 }
 
-func (ak *Akfak) WriteLogEntry(key string, le LogEntry, filename string) (int, error) {
-	f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
-	defer f.Close()
-	if err != nil {
-		log.Fatal(err)
-		return 0, err
-	}
-	enc := json.NewEncoder(f)
-	err = enc.Encode(le)
-	if err != nil {
-		log.Fatal(err)
-		return 0, err
+func (ak *Akfak) WriteLogEntry(key string, le LogEntry) (int, error) {
+	ak.mu.Lock()
+	defer ak.mu.Unlock()
+	if _, ok := ak.data[key]; ok {
+		ak.data[key] = append(ak.data[key], le)
+	} else {
+		ak.data[key] = make([]LogEntry, 0)
+		ak.data[key] = append(ak.data[key], le)
 	}
 	return le.Offset, nil
 }
 
-func (ak *Akfak) ReadLogEntry(key string, offset int, filename string) (int, error) {
-	f, err := os.OpenFile(filename, os.O_RDONLY, 0666)
-	defer f.Close()
-	if err != nil {
-		log.Fatal(err)
-		return 0, err
-	}
-	reader := bufio.NewReader(f)
-	dec := json.NewDecoder(reader)
-	entry := LogEntry{}
-	candidate := LogEntry{}
-	for {
-		err := dec.Decode(&entry)
-		if err != nil {
-			//TODO: explicitly handle EOF
-			log.Printf("err during ReadLogEntry: %v\n", err)
-			break
-		}
-		if offset == entry.Offset {
-			candidate.Offset = entry.Offset
-			candidate.Value = entry.Value
+func (ak *Akfak) ReadLogEntry(key string, offset int) (LogEntry, error) {
+	ak.mu.Lock()
+	defer ak.mu.Unlock()
+	for _, le := range ak.data[key] {
+		if le.Offset == offset {
+			return le, nil
 		}
 	}
-	if err != nil {
-		return candidate.Value, err
-	}
-	return candidate.Value, nil
+	return LogEntry{}, errors.New("LogEntry not found")
 }
 
 func main() {
@@ -272,7 +221,7 @@ func main() {
 	ak.neighbors = make([]string, 8)
 	ak.committed_offsets = make(map[string]int)
 	ak.next_offset = make(map[string]int)
-	ak.filenames = make(map[string]string)
+	ak.data = make(map[string][]LogEntry)
 
 	ak.node.Handle("init", ak.HandleInit)
 	ak.node.Handle("send", ak.HandleSend)
