@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"sync"
 
@@ -36,7 +37,7 @@ type CommitOffsetsMessage struct {
 	Type string `json:"type"`
 	Offsets map[string]int `json:"offsets"`
 }
-
+/*
 type GossipCommittedOffsetsMessage struct {
 	Type string `json:"type"`
 	CommittedOffsets map[string]int `json:"committed_offsets"`
@@ -45,7 +46,7 @@ type GossipCommittedOffsetsMessage struct {
 type GossipNextOffsetMessage struct {
 	Type string `json:"type"`
 	NextOffset map[string]int `json:"next_offsets"`
-}
+}*/
 
 type CommitOffsetsMessageResponse struct {
 	Type string `json:"type"`
@@ -74,9 +75,6 @@ type InitMessage struct {
 }
 
 type Akfak struct {
-	committed_offsets map[string]int
-	//maps keys to the next file offset
-	next_offset map[string]int
 	neighbors []string
 	node *maelstrom.Node
 	kv *maelstrom.KV
@@ -100,6 +98,37 @@ func (ak *Akfak) HandleInit(raw_msg maelstrom.Message) error {
 	return nil
 }
 
+func (ak *Akfak) GetNextOffset(key string) (int, error) {
+	ctx := context.Background()
+	next_offset_key := fmt.Sprintf("next_offset_%s", key)	
+	next_offset, err := ak.kv.ReadInt(ctx, next_offset_key)
+	if err != nil {
+		target := &maelstrom.RPCError{}
+		if errors.As(err, &target) {
+			if target.Code == maelstrom.KeyDoesNotExist {
+				next_offset = 1
+				err = ak.kv.Write(ctx, next_offset_key, 2)
+				if err != nil {
+					return 0, err
+				}
+				return next_offset, nil
+			} else {
+				return 0, err
+			}
+		} else {
+			return 0, err
+		}
+	}
+	candidate := next_offset
+	for ;; {
+		err = ak.kv.CompareAndSwap(ctx, next_offset_key, candidate, candidate + 1, true)
+		if err == nil {
+			return candidate , nil
+		}
+		candidate += 1
+	}
+}
+
 func (ak *Akfak) HandleSend(raw_msg maelstrom.Message) error {
 	ak.mu.Lock()
 	defer ak.mu.Unlock()
@@ -111,22 +140,19 @@ func (ak *Akfak) HandleSend(raw_msg maelstrom.Message) error {
 	if msg.Type != "send" {
 		return errors.New("HandleSendMessage tried to process incorrect message type!")
 	}
-	if _, ok := ak.next_offset[msg.Key]; !ok {
-		ak.next_offset[msg.Key] = 0
-	}
-	ak.next_offset[msg.Key] += 1
-	le := LogEntry{ak.next_offset[msg.Key], msg.Message}
-	offset, err := ak.WriteLogEntry(msg.Key, le)
+	candidate, err := ak.GetNextOffset(msg.Key)
 	if err != nil {
 		log.Println(err)
 		return err
 	}
-	gossip := GossipNextOffsetMessage{}
-	gossip.Type = "gossip_next_offset"
-	gossip.NextOffset = make(map[string]int)
-	gossip.NextOffset[msg.Key] = ak.next_offset[msg.Key]
-	ak.Multicast(gossip)
-	response := SendMessageResponse{"send_ok", offset}
+	log.Printf("key: %s\t\toffset: %d\n", msg.Key, candidate)
+	le := LogEntry{candidate, msg.Message}
+	err = ak.WriteLogEntry(msg.Key, le)
+	if err != nil {
+		log.Println(err)
+		return err
+	}
+	response := SendMessageResponse{"send_ok", le.Offset}
 	return ak.node.Reply(raw_msg, response)
 }
 
@@ -143,18 +169,17 @@ func (ak *Akfak) HandlePoll(raw_msg maelstrom.Message) error {
 	}
 	response := PollMessageResponse{"poll_ok", make(map[string][][2]int)}
 	for key := range msg.Offsets {
-		if _, ok := ak.next_offset[key]; ok {
-			Off := ak.next_offset[key]
-			response.Messages[key] = make([][2]int, 0)
-			for offset := 1; offset <= Off; offset += 1 {
-				if offset >= msg.Offsets[key] {
-					le, err := ak.ReadLogEntry(key, offset)
-					if err == nil {
-						response.Messages[key] = append(response.Messages[key], [2]int{offset, int(le.Value)})
-					} else {
-						log.Println(err)
-					}
-				}
+		ctx := context.Background()
+		next_offset_key := fmt.Sprintf("next_offset_%s", key)	
+		next_offset, err := ak.kv.ReadInt(ctx, next_offset_key)
+		if err != nil {
+			return err
+		}
+		response.Messages[key] = make([][2]int, 0)
+		for offset := msg.Offsets[key]; offset <= next_offset + 100; offset += 1 {
+			le, err := ak.ReadLogEntry(key, offset)
+			if err == nil {
+				response.Messages[key] = append(response.Messages[key], [2]int{le.Offset, int(le.Value)})
 			}
 		}
 	}
@@ -173,12 +198,13 @@ func (ak *Akfak) HandleCommitOffsets(raw_msg maelstrom.Message) error {
 		return errors.New("HandleCommitOffsets tried to process incorrect message type!")
 	}
 	for key := range msg.Offsets {
-		ak.committed_offsets[key] = msg.Offsets[key]
+		ctx := context.Background()
+		committed_offsets_key := fmt.Sprintf("committed_offsets_key:%s", key)
+		err := ak.kv.Write(ctx, committed_offsets_key, msg.Offsets[key])
+		if err != nil {
+			return err
+		}
 	}
-	gossip := GossipCommittedOffsetsMessage{}
-	gossip.Type = "gossip_committed_offsets"
-	gossip.CommittedOffsets = msg.Offsets
-	ak.Multicast(gossip)
 	response := CommitOffsetsMessageResponse{"commit_offsets_ok"}
 	return ak.node.Reply(raw_msg, response)
 }
@@ -196,114 +222,49 @@ func (ak *Akfak) HandleListCommittedOffsets(raw_msg maelstrom.Message) error {
 	response.Offsets = make(map[string]int)
 	ak.mu.Lock()
 	for _, key := range msg.Keys {
-		if _, ok := ak.committed_offsets[key]; ok { 
-			response.Offsets[key] = ak.committed_offsets[key]
+		ctx := context.Background()
+		committed_offsets_key := fmt.Sprintf("committed_offsets_key:%s", key)
+		offset, err := ak.kv.ReadInt(ctx, committed_offsets_key)
+		if err != nil {
+			target := &maelstrom.RPCError{}
+			if !errors.As(err, &target) {
+				return err
+			}
+		} else {
+			response.Offsets[key] = offset
 		}
 	}
 	ak.mu.Unlock()
 	return ak.node.Reply(raw_msg, response)
 }
 
-func (ak *Akfak) WriteLogEntry(key string, le LogEntry) (int, error) {
+func (ak *Akfak) WriteLogEntry(key string, le LogEntry) error {
 	ctx := context.Background()
-	entries := make([]LogEntry, 128)
-	err := ak.kv.ReadInto(ctx, key, &entries)
-	if err != nil {
-		target := &maelstrom.RPCError{}
-		if errors.As(err, &target) {
-			if target.Code == maelstrom.KeyDoesNotExist {
-				ctx2 := context.Background()
-				err = ak.kv.Write(ctx2, key, []LogEntry{le})
-				if err != nil {
-					return 0, err
-				}
-				return le.Offset, nil
-			} else {
-				return 0, err
-			}
-		} else {
-			return 0, err
-		}
-	}
+	entry_key := fmt.Sprintf("entry_key:%s_offset:%d", key, le.Offset)
 	ctx = context.Background()
-	err = ak.kv.Write(ctx, key, append(entries, le))
+	err := ak.kv.Write(ctx, entry_key, le.Value)
 	if err != nil {
-		return 0, err
+		log.Printf("[WriteLogEntry] key: %s, le: %v, err: %v\n", key, le, err)
+		return err
 	}
-	return le.Offset, nil
+	return nil
 }
 
 func (ak *Akfak) ReadLogEntry(key string, offset int) (LogEntry, error) {
 	ctx := context.Background()
-	entries := make([]LogEntry, 128)
-	err := ak.kv.ReadInto(ctx, key, &entries)
+	entry_key := fmt.Sprintf("entry_key:%s_offset:%d", key, offset)
+	value, err := ak.kv.ReadInt(ctx, entry_key)
 	if err != nil {
+		log.Printf("[ReadLogEntry] key: %s, offset: %v, err: %v\n", key, offset, err)
 		return LogEntry{}, err
 	}
-	for _, le := range entries {
-		if le.Offset == offset {
-			return le, nil
-		}
-	}
-	return LogEntry{}, errors.New("LogEntry not found")
-}
-
-func (ak *Akfak) HandleGossipNextOffset(msg maelstrom.Message) error {
-	gossip := GossipNextOffsetMessage{}
-	if err := json.Unmarshal(msg.Body, &gossip); err != nil {
-		return err
-	}
-	ak.mu.Lock()
-	for key := range gossip.NextOffset {
-		if ak.next_offset[key] < gossip.NextOffset[key] {
-			ak.next_offset[key] = gossip.NextOffset[key]
-		}
-	}
-	ak.mu.Unlock()
-	reply := make(map[string]any)
-	reply["type"] = "gossip_next_offset_ok"
-	return ak.node.Reply(msg, reply)
-}
-
-func (ak *Akfak) HandleGossipCommittedOffsets(msg maelstrom.Message) error {
-	gossip := GossipCommittedOffsetsMessage{}
-	if err := json.Unmarshal(msg.Body, &gossip); err != nil {
-		return err
-	}
-	ak.mu.Lock()
-	for key := range gossip.CommittedOffsets {
-		ak.committed_offsets[key] = gossip.CommittedOffsets[key]
-	}
-	ak.mu.Unlock()
-	reply := make(map[string]any)
-	reply["type"] = "gossip_committed_offsets_ok"
-	return ak.node.Reply(msg, reply)
-}
-
-func (ak *Akfak) HandleGossipResponse(msg maelstrom.Message) error {
-	return nil
-}
-
-func (ak *Akfak) Multicast(msg interface{}) {
-	if ak.node == nil {
-		panic("me is nil")
-	}
-	for _, node := range ak.neighbors {
-		if node != ak.node.ID() {
-			err := ak.node.RPC(node, msg, ak.HandleGossipResponse)
-			if err != nil {
-				log.Printf("problem sending message to node %v\n", node)
-			}
-		}
-	}
+	return LogEntry{offset, value}, nil
 }
 
 func main() {
 	ak := Akfak{}
 	ak.node = maelstrom.NewNode()
 	ak.neighbors = make([]string, 8)
-	ak.committed_offsets = make(map[string]int)
-	ak.next_offset = make(map[string]int)
 	ak.kv = maelstrom.NewLinKV(ak.node)
 
 	ak.node.Handle("init", ak.HandleInit)
@@ -311,8 +272,6 @@ func main() {
 	ak.node.Handle("poll", ak.HandlePoll)
 	ak.node.Handle("commit_offsets", ak.HandleCommitOffsets)
 	ak.node.Handle("list_committed_offsets", ak.HandleListCommittedOffsets)
-	ak.node.Handle("gossip_committed_offsets", ak.HandleGossipCommittedOffsets)
-	ak.node.Handle("gossip_next_offset", ak.HandleGossipNextOffset)
 
 	if err := ak.node.Run(); err != nil {
 		log.Fatal(err)
